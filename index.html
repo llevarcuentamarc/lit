@@ -389,6 +389,7 @@ body.is-viewer .ro-banner{display:block}
     <button class="tab-btn" onclick="switchTab('resumen',this)">🧮 Resumen</button>
     <button class="tab-btn admin-only" id="tab-btn-actividad" onclick="switchTab('actividad',this)">🔔 Actividad <span class="count-badge" id="act-badge"></span></button>
     <button class="tab-btn admin-only" onclick="switchTab('usuarios',this)">👥 Usuarios</button>
+    <button class="tab-btn admin-only" onclick="switchTab('papelera',this)">🗑 Papelera <span class="count-badge" id="trash-badge" style="display:none"></span></button>
   </div>
 
   <main class="main">
@@ -462,6 +463,16 @@ body.is-viewer .ro-banner{display:block}
         <button class="btn-export" onclick="marcarVistas()">✓ Marcar como leídas</button>
       </div></div>
       <div id="actividad-cont"></div>
+    </div>
+
+    <div class="tab-panel" id="tab-papelera">
+      <div class="toolbar">
+        <div class="toolbar-top">
+          <div class="section-title">Papelera</div>
+        </div>
+        <div style="font-size:12px;color:var(--text-muted)">Los elementos eliminados se conservan 7 días y luego se borran solos.</div>
+      </div>
+      <div id="trash-cont"></div>
     </div>
 
     <div class="tab-panel" id="tab-usuarios">
@@ -562,7 +573,7 @@ body.is-viewer .ro-banner{display:block}
         <div class="del-warn" id="del-txcount"></div>
       </div>
     </div>
-    <p class="del-confirm-text">Esta acción es <strong>permanente e irreversible</strong>. Se eliminarán todos los movimientos.</p>
+    <p class="del-confirm-text">La cuenta se moverá a la <strong>papelera</strong> durante 7 días. Podrás restaurarla desde ahí, junto con todos sus movimientos.</p>
     <p class="del-confirm-text" style="margin-bottom:0">Escribe el nombre para confirmar:</p>
     <div class="fg" style="margin-top:10px"><input class="fi" id="del-confirm-input" type="text" placeholder="Escribe el nombre aquí…"/></div>
     <div class="modal-actions">
@@ -725,6 +736,7 @@ function fmtHora(ts){return new Date(ts).toLocaleTimeString("es-ES",{hour:"2-dig
 
 // ---------- Solo administrador: actividad y usuarios ----------
 function startAdminListeners(){
+  startTrashListener();
   db.ref("usuarios/"+me.uid+"/vistoTs").on("value",s=>{vistoTs=s.val()||0;renderActividad();});
   db.ref("usuarios").on("value",s=>{usersData=s.val()||{};renderUsuarios();});
   db.ref("actividad").limitToLast(200).on("value",snap=>{
@@ -861,6 +873,7 @@ function switchTab(name,btn){
   if(name==="historial")renderHistory();
   if(name==="reportes")renderReports();
   if(name==="resumen")renderSummary();
+  if(name==="papelera")renderTrash();
 }
 
 function buildDateSelectors(){
@@ -1151,9 +1164,9 @@ function setHistoryFilter(filter,btn){activeHistoryFilter=filter;renderHistory()
 
 function delTxH(pid,txId){
   if(!requireAdmin())return;
-  if(!confirm("¿Eliminar este movimiento?"))return;
-  db.ref(`personas/${pid}/transacciones/${txId}`).remove()
-    .then(()=>{toast("Movimiento eliminado","ok");setTimeout(renderHistory,300);})
+  if(!confirm("¿Mover este movimiento a la papelera? Podrás restaurarlo durante 7 días."))return;
+  moveTxToTrash(pid,txId)
+    .then(()=>{toast("Movimiento enviado a la papelera","ok");setTimeout(renderHistory,300);})
     .catch(e=>toast("Error: "+e.message,"err"));
 }
 
@@ -1314,9 +1327,9 @@ function saveTx(){
 
 function delTx(pid,txId){
   if(!requireAdmin())return;
-  if(!confirm("¿Eliminar este movimiento?"))return;
-  db.ref(`personas/${pid}/transacciones/${txId}`).remove()
-    .then(()=>toast("Movimiento eliminado","ok"))
+  if(!confirm("¿Mover este movimiento a la papelera? Podrás restaurarlo durante 7 días."))return;
+  moveTxToTrash(pid,txId)
+    .then(()=>toast("Movimiento enviado a la papelera","ok"))
     .catch(e=>toast("Error: "+e.message,"err"));
 }
 
@@ -1382,8 +1395,106 @@ function confirmDelPerson(){
     setTimeout(()=>document.getElementById("del-confirm-input").style.borderColor="",2000);
     return;
   }
-  db.ref(`personas/${delPid}`).remove()
-    .then(()=>{closeModal("mdel");toast("Cuenta eliminada","ok");})
+  if(!p){toast("La cuenta ya no existe","err");closeModal("mdel");return;}
+  const id=db.ref("papelera").push().key;
+  const entry=buildTrashEntry({tipo:"persona",pid:delPid,nombre:p.nombre||"",datos:p});
+  db.ref().update({[`papelera/${id}`]:entry,[`personas/${delPid}`]:null})
+    .then(()=>{closeModal("mdel");toast("Cuenta enviada a la papelera","ok");})
+    .catch(e=>toast("Error: "+e.message,"err"));
+}
+
+// ---------- Papelera (solo administrador) ----------
+const TRASH_DAYS=7;
+const TRASH_MS=TRASH_DAYS*24*60*60*1000;
+let trashData={};
+
+function buildTrashEntry(base){
+  const now=Date.now();
+  return {...base,usuario:me.usuario,eliminadoTs:now,expiraTs:now+TRASH_MS};
+}
+
+function moveTxToTrash(pid,txId){
+  const tx=data[pid]?.transacciones?.[txId];
+  if(!tx)return Promise.reject(new Error("El movimiento ya no existe"));
+  const id=db.ref("papelera").push().key;
+  const entry=buildTrashEntry({tipo:"movimiento",pid,txId,nombre:data[pid].nombre||"",datos:tx});
+  return db.ref().update({[`papelera/${id}`]:entry,[`personas/${pid}/transacciones/${txId}`]:null});
+}
+
+function startTrashListener(){
+  db.ref("papelera").on("value",snap=>{
+    trashData=snap.val()||{};
+    const now=Date.now();
+    const expired=Object.keys(trashData).filter(k=>(trashData[k].expiraTs||0)<now);
+    if(expired.length){
+      const upd={};
+      expired.forEach(k=>{upd[`papelera/${k}`]=null;delete trashData[k];});
+      db.ref().update(upd).catch(()=>{});
+    }
+    renderTrash();
+  });
+}
+
+function renderTrash(){
+  const ids=Object.keys(trashData).sort((a,b)=>(trashData[b].eliminadoTs||0)-(trashData[a].eliminadoTs||0));
+  const badge=document.getElementById("trash-badge");
+  badge.textContent=ids.length;
+  badge.style.display=ids.length?"inline-block":"none";
+  const c=document.getElementById("trash-cont");
+  if(!ids.length){
+    c.innerHTML=`<div class="empty-state"><div style="font-size:40px;margin-bottom:12px">🗑</div><div>La papelera está vacía.</div></div>`;
+    return;
+  }
+  c.innerHTML=`<div class="act-list">`+ids.map(id=>{
+    const it=trashData[id];
+    const d=it.datos||{};
+    let title,sub;
+    if(it.tipo==="persona"){
+      const n=Object.keys(d.transacciones||{}).length;
+      title="👤 "+esc(it.nombre||d.nombre||"Cuenta");
+      sub=`Cuenta · ${n} movimiento${n===1?"":"s"}`;
+    }else{
+      const tipo=d.tipo==="deposito"?"Depósito":"Retiro";
+      title=`${tipo} · $${fmt(d.monto)} · ${esc(it.nombre||"")}`;
+      sub=`${esc(d.fecha||"sin fecha")}${d.descripcion?" · "+esc(d.descripcion):""}`;
+    }
+    const left=Math.max(0,Math.ceil((it.expiraTs-Date.now())/86400000));
+    return`<div class="act-item trash-item">
+      <div style="flex:1;min-width:0">
+        <div style="font-weight:600;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${title}</div>
+        <div style="font-size:11px;color:var(--text-muted);margin-top:3px">${sub}</div>
+        <div style="font-size:10px;color:var(--text-dim);margin-top:3px">Eliminado por ${esc(it.usuario||"—")} · ${fmtFechaHora(it.eliminadoTs)} · quedan ${left} día${left===1?"":"s"}</div>
+      </div>
+      <div style="display:flex;gap:6px;flex-shrink:0">
+        <button class="header-btn" style="color:var(--green);border-color:var(--green)" onclick="restoreTrash('${id}')">↩ Restaurar</button>
+        <button class="header-btn logout-btn" onclick="purgeTrash('${id}')" title="Eliminar definitivamente">✕</button>
+      </div>
+    </div>`;
+  }).join("")+`</div>`;
+}
+
+function restoreTrash(id){
+  if(!requireAdmin())return;
+  const item=trashData[id];
+  if(!item){toast("Elemento no encontrado","err");return;}
+  const upd={[`papelera/${id}`]:null};
+  if(item.tipo==="persona"){
+    if(data[item.pid]){toast("Ya existe una cuenta con ese registro","err");return;}
+    upd[`personas/${item.pid}`]=item.datos;
+  }else{
+    if(!data[item.pid]){toast("Primero restaura la cuenta de "+(item.nombre||"esta persona"),"err");return;}
+    upd[`personas/${item.pid}/transacciones/${item.txId}`]=item.datos;
+  }
+  db.ref().update(upd)
+    .then(()=>toast("↩ Restaurado","ok"))
+    .catch(e=>toast("Error: "+e.message,"err"));
+}
+
+function purgeTrash(id){
+  if(!requireAdmin())return;
+  if(!confirm("¿Eliminar definitivamente? Esta acción no se puede deshacer."))return;
+  db.ref(`papelera/${id}`).remove()
+    .then(()=>toast("Eliminado definitivamente","ok"))
     .catch(e=>toast("Error: "+e.message,"err"));
 }
 
